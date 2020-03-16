@@ -25,13 +25,16 @@ class Settings(object):
 	OUTPUT_MODEL = None
 	OUTPUT_LOGS  = None
 
-	TFRECORD_TRAIN = None
-	TFRECORD_VAL   = None
-	AUGMENTATION   = None
-	N_SIZE         = None
-	N_LEN          = None
-	CHANNELS       = ""
-	POINTNET       = False
+	DATA_ROOT_PATH  = None
+	TFRECORD_TRAIN 	= None
+	TFRECORD_VAL   	= None
+	TFRECORD_TEST   = None
+	AUGMENTATION   	= None
+	RANDOM_FLIPPING	= None
+	N_SIZE         	= None
+	N_LEN          	= None
+	CHANNELS       	= ""
+	POINTNET       	= False
 
 	TEST_CHECKPOINT     = None
 	TEST_OUTPUT_PATH    = None
@@ -69,8 +72,11 @@ class Settings(object):
 
 		# SETTING VALUES
 		if "config" in required_args:
+			self.DATA_ROOT_PATH = config["DATA"]["data_root_path"]
 			self.TFRECORD_TRAIN = config["DATA"]["tfrecord_train"]
 			self.TFRECORD_VAL   = config["DATA"]["tfrecord_val"]
+			self.TFRECORD_TEST   = config["DATA"]["tfrecord_test"]
+			self.VALIDATION_RATIO = float(config["DATA"]["validation_ratio"])
 			self.AUGMENTATION   = eval(config["DATA"]["augmentation"])
 			self.N_SIZE         = eval(config["DATA"]["n_size"])
 			self.N_LEN          = self.N_SIZE[0] * self.N_SIZE[1] - 1

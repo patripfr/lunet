@@ -25,26 +25,68 @@ import data_loader
 from settings import Settings
 CONFIG = Settings(required_args=["config"])
 
-
-semantic_base = "/path/to/squeezeseg/dataset/"
-
 # Generates tfrecords for training
 def make_tfrecord():
 
 	# Creates each tfrecord (train and val)
-	for dataset in ["train", "val"]:
+
+	list_subfolders_with_paths = [f[0] for f in os.walk(CONFIG.DATA_ROOT_PATH)]
+	train_folder_name = open(CONFIG.DATA_ROOT_PATH + "train.txt", "r")
+	val_folder_name = open(CONFIG.DATA_ROOT_PATH + "val.txt", "r")
+	test_folder_name = open(CONFIG.DATA_ROOT_PATH + "test.txt", "r")
+	train_image_idx = []
+	val_image_idx = []
+	test_image_idx = []
+	for subfolder in train_folder_name:
+		npy_files_in_subfolder = []
+		subfolder = subfolder.rstrip("\n")
+		for f in os.listdir(subfolder):
+			npy_file = os.path.join(subfolder, f)
+			assert os.path.exists(npy_file), \
+				'File does not exist: {}'.format(npy_file)
+			if (os.path.isfile(npy_file) and npy_file[-3:] == "npy"):
+				train_image_idx.append(npy_file)
+	for subfolder in val_folder_name:
+		subfolder = subfolder.rstrip("\n")
+		npy_files_in_subfolder = []
+		for f in os.listdir(subfolder):
+			npy_file = os.path.join(subfolder, f)
+			assert os.path.exists(npy_file), \
+				'File does not exist: {}'.format(npy_file)
+			if (os.path.isfile(npy_file) and npy_file[-3:] == "npy"):
+				val_image_idx.append(npy_file)
+	for subfolder in test_folder_name:
+		subfolder = subfolder.rstrip("\n")
+		npy_files_in_subfolder = []
+		for f in os.listdir(subfolder):
+			npy_file = os.path.join(subfolder, f)
+			assert os.path.exists(npy_file), \
+				'File does not exist: {}'.format(npy_file)
+			if (os.path.isfile(npy_file) and npy_file[-3:] == "npy"):
+				test_image_idx.append(npy_file)
+
+	for dataset in ["train", "val", "test"]:
+	#for dataset in ["test"]:
 
 		# Get path
-		dataset_output = CONFIG.TFRECORD_TRAIN if dataset == "train" else CONFIG.TFRECORD_VAL
+		dataset_ouput = ""
+		if (dataset == "train"):
+			dataset_output = CONFIG.TFRECORD_TRAIN
+		if (dataset == "val"):
+			dataset_output = CONFIG.TFRECORD_VAL
+		if (dataset == "test"):
+			dataset_output = CONFIG.TFRECORD_TEST
 
 		with tf.python_io.TFRecordWriter(dataset_output) as writer:
 
 			file_list_name = open(dataset_output + ".txt", "w")
 
+			if dataset == "train":
+				file_list = train_image_idx
 			if dataset == "val":
-				file_list = open("./data/semantic_val.txt","r")
-			else:
-				file_list = open("./data/semantic_train.txt", "r")
+				file_list = val_image_idx
+			if dataset == "test":
+				file_list = test_image_idx
 
 			# Going through each example
 			line_num = 1
@@ -58,7 +100,9 @@ def make_tfrecord():
 					print("[{}] >> Processing file \"{}\" ({}), with augmentation : {}".format(dataset, file[:-1], line_num, aug_type))
 
 					# Load labels
-					data = np.load(semantic_base + file[:-1] + ".npy")
+					data = np.load(file)
+
+					data = data[:,0::4,:]
 
 					mask = data[:,:,0] != 0
 
@@ -107,7 +151,7 @@ def make_tfrecord():
 					# Adding Example to tfrecord
 					writer.write(example.SerializeToString())
 
-					file_list_name.write(semantic_base + file[:-1] + ".npy\n")
+					file_list_name.write(file +"\n")
 
 				line_num += 1
 

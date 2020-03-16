@@ -9,31 +9,45 @@ import math
 import sys
 sys.path.append('./')
 from settings import Settings
+from data_loader import file_loader
 CONFIG = Settings()
 
-
 ############################## TFRECORD READER ##############################
-
-# Takes a sequence of channels and returns the corresponding indices in the rangeimage
-def seq_to_idx(seq):
-	idx = []
-	if "x" in seq:
-		idx.append(0)
-	if "y" in seq:
-		idx.append(1)
-	if "z" in seq:
-		idx.append(2)
-	if "r" in seq:
-		idx.append(3)
-	if "d" in seq:
-		idx.append(4)
-
-	return np.array(idx, dtype=np.intp)
-
 
 # Loads a queue of random examples, and returns a batch iterator for each input
 # and output
 def read_example(filename, batch_size):
+
+	# Open tfrecord
+	reader = tf.TFRecordReader()
+	filename_queue = tf.train.string_input_producer([filename], num_epochs=None)
+	_, serialized_example = reader.read(filename_queue)
+
+	# Create random queue
+	min_queue_examples = 500
+	batch = tf.train.shuffle_batch([serialized_example], batch_size=batch_size, capacity=min_queue_examples+100*batch_size, min_after_dequeue=min_queue_examples, num_threads=2)
+
+	# Read a batch
+	parsed_example = tf.parse_example(batch,features={'neighbors': tf.FixedLenFeature([], tf.string),'points': tf.FixedLenFeature([], tf.string),'label': tf.FixedLenFeature([], tf.string)})
+
+	# Decode point cloud
+	idx = seq_to_idx(CONFIG.CHANNELS)
+
+	points_raw = tf.decode_raw(parsed_example['points'], tf.float32)
+	points = tf.reshape(points_raw, [batch_size, CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, 1 , 5])
+	points = tf.gather(points, seq_to_idx(CONFIG.CHANNELS), axis=3)
+
+	neighbors_raw = tf.decode_raw(parsed_example['neighbors'], tf.float32)
+	neighbors = tf.reshape(neighbors_raw, [batch_size, CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, CONFIG.N_LEN, 5])
+	neighbors = tf.gather(neighbors, seq_to_idx(CONFIG.CHANNELS), axis=3)
+
+	# Decode label
+	label_raw = tf.decode_raw(parsed_example['label'], tf.float32)
+	label = tf.reshape(label_raw, [batch_size, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, CONFIG.N_CLASSES + 2])
+
+	return points, neighbors, label
+
+def read_example_simple(filename, batch_size):
 
 	# Open tfrecord
 	reader = tf.TFRecordReader()
@@ -251,12 +265,16 @@ def u_net_loss(pred, label):
 				iou = tf.reduce_sum(tf.cast(tf.logical_and(intersection, mask_bin), tf.float32)) / (tf.reduce_sum(tf.cast(tf.logical_and(union, mask_bin), tf.float32)) + 0.00000001)
 				tf.summary.scalar("iou_class_0" + str(c), iou)
 
-
 	# Display prediction and groundtruth for object of class 1
-	with tf.variable_scope('predictions'):
+	with tf.variable_scope('soft_predictions'):
 		for i in range(0, CONFIG.N_CLASSES):
 			tf.summary.image('pred_class_0' + str(i),
 						 	tf.reshape(tf.transpose(slice_tensor(pred, i, i) * mask, perm=[0,3,1,2]), (CONFIG.BATCH_SIZE, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, 1)),
+						 	max_outputs=CONFIG.BATCH_SIZE)
+	with tf.variable_scope('hard_predictions'):
+		for i in range(0, CONFIG.N_CLASSES):
+			tf.summary.image('pred_class_0' + str(i),
+						 	tf.reshape(tf.transpose(slice_tensor(tf.nn.softmax(pred), i, i) * mask, perm=[0,3,1,2]), (CONFIG.BATCH_SIZE, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, 1)),
 						 	max_outputs=CONFIG.BATCH_SIZE)
 
 
@@ -311,105 +329,116 @@ def get_learning_rate(iteration, start_rate, decay_interval, decay_value):
 # Training routine
 def train():
 	# Remove deprecated messages
-	tf.logging.set_verbosity(tf.logging.ERROR)
+	config = tf.ConfigProto()
+	config.gpu_options.allow_growth = True
+	with tf.Session(config=config) as sess:
+		#tf.compat.v1.disable_eager_execution()
+		tf.logging.set_verbosity(tf.logging.ERROR)
+		loader = file_loader(CONFIG)
+		# # Reading TFRecords
+		# with tf.name_scope('train_batch'):
+		# 	batch_points, batch_neighbors, batch_label = loader.read_batch(training = True)
+		# with tf.name_scope('val_batch'):
+		# 	val_points, val_neighbors, val_label = loader.read_batch(training = False)
+		with tf.name_scope('learning_rate'):
+			learning_rate = tf.placeholder(tf.float32, shape=[], name="learning_rate_placeholder")
 
-	# Reading TFRecords
-	with tf.name_scope('train_batch'):
-		batch_points, batch_neighbors, batch_label = read_example(CONFIG.TFRECORD_TRAIN, CONFIG.BATCH_SIZE)
-	with tf.name_scope('val_batch'):
-		val_points, val_neighbors, val_label = read_example(CONFIG.TFRECORD_VAL, CONFIG.BATCH_SIZE)
-	with tf.name_scope('learning_rate'):
-		learning_rate = tf.placeholder(tf.float32, shape=[], name="learning_rate_placeholder")
-
-	# Save learning rate
-	tf.summary.scalar("learning_rate", learning_rate, family="learning_rate")
-
-
-	# Creating input placeholder
-	points    = tf.placeholder(shape = [None, CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, 1, CONFIG.IMAGE_DEPTH], dtype=tf.float32, name='points_placeholder')
-	neighbors = tf.placeholder(shape = [None, CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, CONFIG.N_LEN, CONFIG.IMAGE_DEPTH], dtype=tf.float32, name='neighbors_placeholder')
-	label     = tf.placeholder(shape = [None, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, CONFIG.N_CLASSES+2], dtype=tf.float32, name='label_placeholder')
-
-	train_flag = tf.placeholder(dtype=tf.bool, name='flag_placeholder')
+		# Save learning rate
+		tf.summary.scalar("learning_rate", learning_rate, family="learning_rate")
 
 
-	# Create Network and Loss operator
-	y    = u_net(points, neighbors, train_flag)
-	loss = u_net_loss(y, label)
+		# Creating input placeholder
+		points    = tf.placeholder(shape = [None, CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, 1, CONFIG.IMAGE_DEPTH], dtype=tf.float32, name='points_placeholder')
+		neighbors = tf.placeholder(shape = [None, CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, CONFIG.N_LEN, CONFIG.IMAGE_DEPTH], dtype=tf.float32, name='neighbors_placeholder')
+		label     = tf.placeholder(shape = [None, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, CONFIG.N_CLASSES+2], dtype=tf.float32, name='label_placeholder')
+		#points, neighbors, labels = loader.get_train_data_loader().get_next()
+
+		train_flag = tf.placeholder(dtype=tf.bool, name='flag_placeholder')
 
 
-	# Creating optimizer
-	opt = tf.train.AdamOptimizer(learning_rate=CONFIG.LEARNING_RATE)
-
-	update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-	with tf.control_dependencies(update_ops):
-		train_step = opt.minimize(loss)
-
-	# Merging summaries
-	summary_op = tf.summary.merge_all()
-
-	# Saver for checkpoints
-	saver = tf.train.Saver(max_to_keep=1000)
-
-	# Starting session
-	sess = tf.Session()
-	init = tf.global_variables_initializer()
-	sess.run(init)
-
-	# Check if a checkpoint already exists and load it
-	start_step = 0
-	if get_last_checkpoint(CONFIG.OUTPUT_MODEL) >= 0:
-		start_step = get_last_checkpoint(CONFIG.OUTPUT_MODEL)
-		print("[From checkpoint] Restoring checkpoint {}".format(start_step))
-		saver.restore(sess, CONFIG.OUTPUT_MODEL + "-" + str(start_step))
+		# Create Network and Loss operator
+		y    = u_net(points, neighbors, train_flag)
+		loss = u_net_loss(y, label)
 
 
-	# Creating threads for batch sampling
-	coord  = tf.train.Coordinator()
-	threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+		# Creating optimizer
+		opt = tf.train.AdamOptimizer(learning_rate=CONFIG.LEARNING_RATE)
 
-	# Creating output logs
-	train_summary_writer = tf.summary.FileWriter(CONFIG.OUTPUT_LOGS + "train/", tf.get_default_graph())
-	val_summary_writer   = tf.summary.FileWriter(CONFIG.OUTPUT_LOGS + "val/", tf.get_default_graph())
+		update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+		with tf.control_dependencies(update_ops):
+			train_step = opt.minimize(loss)
 
-	# Display config
-	print_config()
+		# Merging summaries
+		summary_op = tf.summary.merge_all()
 
-	# Starting iterations
-	for i in range(start_step, CONFIG.NUM_ITERS):
+		# Saver for checkpoints
+		saver = tf.train.Saver(max_to_keep=1000)
 
-		# Retrieving current batch
-		points_data, neighbors_data, label_data = sess.run([batch_points, batch_neighbors, batch_label])
+		# Starting session
+		#session_config = tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True))
+		#config = tf.ConfigProto()
+		#config.gpu_options.per_process_gpu_memory_fraction = 0.2
+		# = tf.Session(config = config)
+		init = tf.global_variables_initializer()
+		sess.run(init)
 
-		# Computing learning rate
-		rate = get_learning_rate(i, CONFIG.LEARNING_RATE, CONFIG.LR_DECAY_INTERVAL, CONFIG.LR_DECAY_VALUE)
+		# Check if a checkpoint already exists and load it
+		start_step = 0
+		if get_last_checkpoint(CONFIG.OUTPUT_MODEL) >= 0:
+			start_step = get_last_checkpoint(CONFIG.OUTPUT_MODEL)
+			print("[From checkpoint] Restoring checkpoint {}".format(start_step))
+			saver.restore(sess, CONFIG.OUTPUT_MODEL + "-" + str(start_step))
 
-		# Training Network on the current batch
-		t = time.time()
-		_, loss_data, data = sess.run([train_step, loss, y], feed_dict={train_flag: True, points: points_data, neighbors: neighbors_data, label: label_data, learning_rate: rate})
 
-		print('[Training] Iteration: {}, loss: {}, {} e/s '.format(int(i), loss_data, time_to_speed(time.time() - t, CONFIG.BATCH_SIZE)))
+		# Creating threads for batch sampling
+		coord  = tf.train.Coordinator()
+		threads = tf.train.start_queue_runners(sess=sess, coord=coord)
 
-		# If summary has to be saved
-		if i % 100 == 0:
-			summary_str = sess.run(summary_op, feed_dict={train_flag: True, points: points_data, neighbors: neighbors_data, label: label_data, learning_rate: rate})
-			train_summary_writer.add_summary(summary_str, i)
-		# If checkpoint has to be saved
-		if (i + 1) % CONFIG.SAVE_INTERVAL == 0:
-			saver.save(sess, CONFIG.OUTPUT_MODEL, global_step=i+1)
-		# If validation should be done
-		if i % CONFIG.VAL_INTERVAL == 0:
-			# Retrieving validation batch
-			points_data, neighbors_data, label_data = sess.run([val_points, val_neighbors, val_label])
+		# Creating output logs
+		train_summary_writer = tf.summary.FileWriter(CONFIG.OUTPUT_LOGS + "train/", tf.get_default_graph())
+		val_summary_writer   = tf.summary.FileWriter(CONFIG.OUTPUT_LOGS + "val/", tf.get_default_graph())
 
-			# Running summaries and saving
-			summary_str = sess.run(summary_op, feed_dict={train_flag: False, points: points_data, neighbors: neighbors_data, label: label_data, learning_rate: rate})
-			val_summary_writer.add_summary(summary_str, i)
+		# Display config
+		print_config()
 
-			print("[Validation] Done on one batch")
+		# Starting iterations
+		for i in range(start_step, CONFIG.NUM_ITERS):
 
-	# Saving final network configuration
-	saver.save(sess, CONFIG.OUTPUT_MODEL, global_step=i+1)
+			# Retrieving current batch
+			#points_data, neighbors_data, label_data = loader.read_batch(training = True)
+
+			t = time.time()
+			points_batch, neighbors_batch, labels_batch = loader.read_batch(training = True)
+			#print("loading: ", time_to_speed(time.time() - t, CONFIG.BATCH_SIZE))
+			# Computing learning rate
+			rate = get_learning_rate(i, CONFIG.LEARNING_RATE, CONFIG.LR_DECAY_INTERVAL, CONFIG.LR_DECAY_VALUE)
+
+			# Training Network on the current batch
+			t = time.time()
+			_, loss_data, data = sess.run([train_step, loss, y], feed_dict={train_flag: True, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+
+			print('[Training] Iteration: {}, loss: {}, {} e/s '.format(int(i), loss_data, time_to_speed(time.time() - t, CONFIG.BATCH_SIZE)))
+
+			# If summary has to be saved
+			if i % 100 == 0:
+				summary_str = sess.run(summary_op, feed_dict={train_flag: True, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+				train_summary_writer.add_summary(summary_str, i)
+			# If checkpoint has to be saved
+			if (i + 1) % CONFIG.SAVE_INTERVAL == 0:
+				saver.save(sess, CONFIG.OUTPUT_MODEL, global_step=i+1)
+			# If validation should be done
+			if i % CONFIG.VAL_INTERVAL == 0:
+				# Retrieving validation batch
+				points_batch, neighbors_batch, labels_batch = loader.read_batch(training = False)
+				#
+				# # Running summaries and saving
+				summary_str = sess.run(summary_op, feed_dict={train_flag: False, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+				val_summary_writer.add_summary(summary_str, i)
+
+				print("[Validation] Done on one batch")
+
+		# Saving final network configuration
+		saver.save(sess, CONFIG.OUTPUT_MODEL, global_step=i+1)
 
 if __name__ == "__main__":
 	train()
