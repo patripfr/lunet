@@ -194,11 +194,12 @@ def pointnetize_slow(groundtruth, n_size=[3, 3]):
 				n = lin_patch[n_indices, :]
 
 				mask_filled = n[:,0] != 0
-				mask = mask + np.sum(mask_filled.flatten())
 				mask_not_filled = n[:,0] == 0
 
 				n[mask_filled, 0:3] = n[mask_filled, 0:3] - p[0:3] # Defined points in local coordinates
+
 				n[mask_not_filled,:] = 0
+				
 				n_output[y,x,:,:] = n
 				p_output[y,x,:,:] = p
 	return p_output, n_output
