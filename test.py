@@ -6,13 +6,16 @@ import os
 import sys
 import time
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import cm
 
 sys.path.append('./')
 import data_loader
 from settings import Settings
 CONFIG = Settings(required_args=["gpu","config","checkpoint"])
-
+scan_loader = data_loader.file_loader(CONFIG, test = True)
 
 # Computes softmax
 def softmax(x):
@@ -98,28 +101,12 @@ def seq_to_idx(seq):
 	return np.array(idx, dtype=np.intp)
 
 # Read a single file
-def read_example(string_record):
-
-	# Create example
-	example = tf.train.Example()
-	example.ParseFromString(string_record)
-
-	features = example.features.feature
-
-	points_lin    = np.fromstring(features["points"].bytes_list.value[0],    dtype=np.float32)
-	neighbors_lin = np.fromstring(features["neighbors"].bytes_list.value[0], dtype=np.float32)
-	label_lin     = np.fromstring(features["label"].bytes_list.value[0],     dtype=np.float32)
-
-	points    = np.reshape(points_lin,    (CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, 1, 5))
-	neighbors = np.reshape(neighbors_lin, (CONFIG.IMAGE_HEIGHT * CONFIG.IMAGE_WIDTH, CONFIG.N_LEN, 5))
-
-	points    = np.take(points,    seq_to_idx(CONFIG.CHANNELS), axis=2)
-	neighbors = np.take(neighbors, seq_to_idx(CONFIG.CHANNELS), axis=2)
-
-	label = np.reshape(label_lin, (CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, CONFIG.N_CLASSES + 2))
-	groundtruth = np.argmax(label[:,:,0:CONFIG.N_CLASSES], axis=2)
-	mask = label[:,:,CONFIG.N_CLASSES+1] == 1
-
+def read_example():
+	points, neighbors, label = scan_loader.read_batch(training = False)
+	groundtruth = np.argmax(label[:,:,:,0:CONFIG.N_CLASSES], axis=3)
+	groundtruth = np.squeeze(groundtruth)
+	mask = label[:,:,:,CONFIG.N_CLASSES+1] == 1
+	mask = np.squeeze(mask)
 	return points, neighbors, groundtruth, label[:,:,0:CONFIG.N_CLASSES], mask
 
 
@@ -135,7 +122,7 @@ def test(checkpoint = None, display=False):
 	if not os.path.exists(CONFIG.TEST_OUTPUT_PATH):
 		os.makedirs(CONFIG.TEST_OUTPUT_PATH)
 
-	print("Processing dataset file \"{}\" for checkpoint {}:".format(CONFIG.TFRECORD_VAL, str(CONFIG.TEST_CHECKPOINT)))
+	print("Processing dataset file \"{}\" for checkpoint {}:".format(CONFIG.TFRECORD_TEST, str(CONFIG.TEST_CHECKPOINT)))
 
 	graph = tf.Graph()
 	with tf.Session(graph=graph) as sess:
@@ -148,9 +135,6 @@ def test(checkpoint = None, display=False):
 		y          = graph.get_tensor_by_name("net/y:0")
 
 
-		# Dataset iterator
-		record_iterator = tf.python_io.tf_record_iterator(path=CONFIG.TFRECORD_VAL)
-
 		# Running network on each example
 		line_num   = 1
 
@@ -158,39 +142,33 @@ def test(checkpoint = None, display=False):
 		fns_sum = 0
 		fps_sum = 0
 
-		for string_record in record_iterator:
+		CONFIG.BATCH_SIZE = 1
+		fill_length = len(str(scan_loader.test_len))
+		for line_num in range(scan_loader.test_len):
 
-			CONFIG.BATCH_SIZE = 1
-
-			if line_num < 2090:
-				line_num = line_num + 1
-				continue
-
-			points_data, neighbors_data, groundtruth, label, mask = read_example(string_record)
+			points_data, neighbors_data, groundtruth, label, mask = read_example()
 
 			ref = np.reshape(points_data, (CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, CONFIG.IMAGE_DEPTH))
 			img = ref
 			groundtruth = data_loader.apply_mask(groundtruth, mask)
 
 			# Inference
-			data = sess.run(y, feed_dict = {points: [points_data], neighbors: [neighbors_data], train_flag: False})
+			data = sess.run(y, feed_dict = {points: points_data, neighbors: neighbors_data, train_flag: False})
 			pred = softmax(data[0,:,:,:])
 
-			if display:
-				plt.subplot(4,1,1)
-				plt.imshow(ref[:,:,3] * mask)
-				plt.title("Reflectance (for visualization)")
-				plt.subplot(4,1,2)
-				plt.imshow(pred[:,:,1] * mask)
-				plt.title("Car prob")
-				plt.subplot(4,1,3)
-				plt.imshow(np.argmax(pred, axis=2) * mask)
-				plt.title("Prediction")
-				plt.subplot(4,1,4)
-				plt.imshow(groundtruth)
-				plt.title("Label")
-				plt.show()
+			bgr_image = cm.viridis(ref[:,:,3])[:,:,:3]*255
+			viridis_image = np.zeros([CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH,3])
+			viridis_image[:,:,0], viridis_image[:,:,1], viridis_image[:,:,2]= bgr_image[:,:,2], bgr_image[:,:,1], bgr_image[:,:,0]
 
+			labels = np.argmax(pred, axis=2) * mask * 255
+
+			dynamic_pixels = np.argwhere(labels==255)
+			for pixel in dynamic_pixels:
+				viridis_image[pixel[0], pixel[1], :] = [0, 0, 255]
+
+			new_image = viridis_image.astype(np.uint8)
+
+			cv2.imwrite(CONFIG.TEST_OUTPUT_PATH + str(line_num).zfill(fill_length) + '.png', new_image)
 
 			iou, tps, fps, fns = compute_iou_per_class(pred, groundtruth, mask, CONFIG.N_CLASSES)
 
@@ -220,19 +198,20 @@ def ckpt_exists(ckpt):
 
 if __name__ == "__main__":
 	file = open("results_" + os.path.basename(CONFIG.CONFIG_NAME)[:-4] + ".txt", "w")
-	
-	ckpt = CONFIG.SAVE_INTERVAL
-	while ckpt <= CONFIG.NUM_ITERS:
-		output = test(checkpoint = ckpt)
-	
-		print(output)
-		file.write(output)
-		file.flush()
-	
-		while not ckpt_exists(ckpt + CONFIG.SAVE_INTERVAL) and ckpt < CONFIG.NUM_ITERS:
-			print("Waiting for the next checkpoint ...")
-			time.sleep(60)
-	
-		ckpt += CONFIG.SAVE_INTERVAL
-	
+
+	ckpt = 40000
+	# ckpt = CONFIG.SAVE_INTERVAL
+	# while ckpt <= CONFIG.NUM_ITERS:
+	output = test(checkpoint = ckpt)
+
+	print(output)
+	file.write(output)
+	file.flush()
+
+	# while not ckpt_exists(ckpt + CONFIG.SAVE_INTERVAL) and ckpt < CONFIG.NUM_ITERS:
+	# 	print("Waiting for the next checkpoint ...")
+	# 	time.sleep(60)
+
+	# ckpt += CONFIG.SAVE_INTERVAL
+
 	file.close()

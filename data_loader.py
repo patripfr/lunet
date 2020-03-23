@@ -199,7 +199,7 @@ def pointnetize_slow(groundtruth, n_size=[3, 3]):
 				n[mask_filled, 0:3] = n[mask_filled, 0:3] - p[0:3] # Defined points in local coordinates
 
 				n[mask_not_filled,:] = 0
-				
+
 				n_output[y,x,:,:] = n
 				p_output[y,x,:,:] = p
 	return p_output, n_output
@@ -237,26 +237,31 @@ def gt_to_label(groundtruth, mask, n_classes):
 
 class file_loader():
 	"""Image database."""
-	def __init__(self, settings):
+	def __init__(self, settings, test=False):
 		self._image_set = []
 		self._image_idx = []
 		self._data_root_path = []
 		self._settings = settings
-		self._train_image_idx, self._val_image_idx = self._load_image_set_idx()
-
-		## batch reader ##
-		self._perm_train_idx = None
-		self._perm_val_idx = None
-		self._cur_train_idx = 0
-		self._cur_val_idx = 0
-		self._shuffle_train_image_idx()
-		self._shuffle_val_image_idx()
 		self._n_size = settings.N_SIZE
 		self._y_offset    = int(math.floor(self._n_size[0] / 2))
 		self._x_offset    = int(math.floor(self._n_size[1] / 2))
 		self._n_len       = self._n_size[0] * self._n_size[1]
 		self._mid_offset  = int(math.floor(self._n_len / 2))
 		self._n_indices   = np.delete(np.arange(self._n_len), self._mid_offset)
+		self._test = test
+		## batch reader ##
+		self._train_image_idx, self._val_image_idx = self._load_image_set_idx()
+		self._perm_train_idx = None
+		self._perm_val_idx = None
+		self._cur_train_idx = 0
+		self._cur_val_idx = 0
+		self._shuffle_train_image_idx()
+		self._shuffle_val_image_idx()
+		if(self._test):
+			self._test_image_idx = self._load_test_image_set_idx()
+			self.test_len = len(self._test_image_idx)
+			self._cur_test_idx = 0
+
 
 	def _load_image_set_idx(self):
 		train_folders = open(self._settings.DATA_ROOT_PATH + "train.txt", "r")
@@ -266,14 +271,14 @@ class file_loader():
 		val_image_idx = []
 
 		for subfolder in train_folders:
-			npy_files_in_subfolder = []
-			subfolder = subfolder.rstrip("\n")
-			for f in os.listdir(subfolder):
-				npy_file = os.path.join(subfolder, f)
-				assert os.path.exists(npy_file), \
-					'File does not exist: {}'.format(npy_file)
-				if (os.path.isfile(npy_file) and npy_file[-3:] == "npy"):
-					train_image_idx.append(npy_file)
+                        subfolder = subfolder.rstrip("\n")
+                        for dirpath, dirnames, filenames in os.walk(str(subfolder)):
+                            for filename in [f for f in filenames if f.endswith(".npy")]:
+                                npy_file = os.path.join(dirpath, filename)
+
+                                assert os.path.exists(npy_file), \
+                                'File does not exist: {}'.format(npy_file)
+                                train_image_idx.append(npy_file)
 
 		for subfolder in val_folders:
 			subfolder = subfolder.rstrip("\n")
@@ -285,6 +290,21 @@ class file_loader():
 				if (os.path.isfile(npy_file) and npy_file[-3:] == "npy"):
 					val_image_idx.append(npy_file)
 		return train_image_idx, val_image_idx
+
+	def _load_test_image_set_idx(self):
+		test_folders = open(self._settings.DATA_ROOT_PATH + "test.txt", "r")
+		test_image_idx = []
+		for subfolder in test_folders:
+			subfolder = subfolder.rstrip("\n")
+			print("sub: ",subfolder)
+			for dirpath, dirnames, filenames in os.walk(str(subfolder)):
+				for filename in [f for f in filenames if f.endswith(".npy")]:
+					npy_file = os.path.join(dirpath, filename)
+
+					assert os.path.exists(npy_file), \
+					'File does not exist: {}'.format(npy_file)
+					test_image_idx.append(npy_file)
+		return sorted(test_image_idx)
 
 	@property
 	def image_idx(self):
@@ -372,7 +392,7 @@ class file_loader():
 		        batch_idx = self._train_image_idx[self._cur_train_idx:self._cur_train_idx+settings.BATCH_SIZE]
 		        self._cur_train_idx += settings.BATCH_SIZE
 
-		if( not training):
+		elif((not training) and (not self._test)):
 		    if shuffle:
 		      if self._cur_val_idx + settings.BATCH_SIZE >= len(self._val_image_idx):
 		        self._shuffle_val_image_idx()
@@ -386,6 +406,9 @@ class file_loader():
 		      else:
 		        batch_idx = self._val_image_idx[self._cur_val_idx:self._cur_val_idx+settings.BATCH_SIZE]
 		        self._cur_val_idx += settings.BATCH_SIZE
+		else:
+			batch_idx = self._test_image_idx[self._cur_test_idx:self._cur_test_idx + 1]
+			self._cur_test_idx += 1
 
 		points_raw = np.empty([0, settings.IMAGE_HEIGHT , settings.IMAGE_WIDTH, 1 , 5], np.float32)
 		neighbors_raw = np.empty([0, settings.IMAGE_HEIGHT , settings.IMAGE_WIDTH,   settings.N_LEN, 5], np.float32)
@@ -394,6 +417,7 @@ class file_loader():
 		image_idx = []
 
 		for idx in batch_idx:
+			print("idx: ", idx)
 			# load data
 			# loading from npy is 30x faster than loading from pickle
 			t = time.time()
@@ -406,18 +430,15 @@ class file_loader():
 			if(settings.IMAGE_WIDTH == 1024):
 				data = data[:,0::2,:]
 
-			if settings.AUGMENTATION:
-				if settings.RANDOM_FLIPPING:
-					if np.random.rand() > 0.5:
-						# flip y
-						data = data[:, ::-1, :]
-						data[:, :, 1] *= -1
+			if(not self._test):
+				if settings.AUGMENTATION:
+					if settings.RANDOM_FLIPPING:
+						if np.random.rand() > 0.5:
+							# flip y
+							data = data[:,::-1,:]
+							data[:,:,1] *= -1
 
-			t = time.time()
-			#p, n = pointnetize_slow(data[:,:,0:5], n_size=settings.N_SIZE)
 			p, n = self._pointnetize(data[:,:,0:5])
-			# print("pointnetize: ", t-time.time())
-			t = time.time()
 			mask = data[:,:,0] != 0
 
 			groundtruth = apply_mask(data[:,:,5], mask)

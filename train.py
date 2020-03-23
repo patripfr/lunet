@@ -1,5 +1,6 @@
 import os
 import tensorflow as tf
+from tensorflow.keras.mixed_precision import experimental as mixed_precision
 import numpy as np
 import cv2
 import time
@@ -11,6 +12,7 @@ sys.path.append('./')
 from settings import Settings
 from data_loader import file_loader
 CONFIG = Settings()
+VALID_STEPS = 10
 
 ############################## TFRECORD READER ##############################
 
@@ -233,23 +235,28 @@ def u_net_loss(pred, label):
 		if CONFIG.FOCAL_LOSS:
 			with tf.name_scope('focal_loss'):
 				epsilon = 1.e-9
-				gamma   = 2.
-				pred_softmax  = tf.nn.softmax(pred)
-				cross_entropy = tf.multiply(label, -tf.log(pred_softmax))
-				weights_fl    = tf.multiply(label, tf.pow(tf.subtract(1., pred_softmax), gamma))
+				gamma = 2.
+				pred_softmax = tf.nn.softmax(pred)
+				label_ce = label
+				if CONFIG.LABEL_SMOOTHING:
+					label_ce = (1-CONFIG.ALPHA) * label + CONFIG.ALPHA/CONFIG.N_CLASSES
+
+				cross_entropy = tf.multiply(label_ce, -tf.log(tf.math.add(pred_softmax, epsilon)))
+				weights_fl    = tf.multiply(label_ce, tf.pow(tf.subtract(1., pred_softmax), gamma))
+				weights_fl    = tf.clip_by_value(weights_fl, epsilon, 1)
 				weigths_total = weights_fl * weights_ce
 				loss          = tf.reduce_sum(weights_ce * weights_fl * cross_entropy) / tf.reduce_sum(weights_ce)
-
-				tf.summary.scalar("global_loss", loss)
+				#tf.summary.scalar("global_loss", loss)
 		else:
 			with tf.name_scope('loss'):
 
 				cross_entropy = tf.nn.softmax_cross_entropy_with_logits_v2(labels=label, logits=pred, name="cross_entropy")
 				loss          = tf.reduce_sum(tf.reshape(cross_entropy, [CONFIG.BATCH_SIZE, CONFIG.IMAGE_HEIGHT, CONFIG.IMAGE_WIDTH, 1]) * weights_ce) / tf.reduce_sum(weights_ce)
 
-				tf.summary.scalar("global_loss", loss)
+				#tf.summary.scalar("global_loss", loss)
 
 		# Compute average precision
+		ious = []
 		with tf.name_scope('average_precision'):
 			softmax_pred = tf.nn.softmax(pred)
 
@@ -263,7 +270,8 @@ def u_net_loss(pred, label):
 				union        = tf.logical_or(p, l)
 
 				iou = tf.reduce_sum(tf.cast(tf.logical_and(intersection, mask_bin), tf.float32)) / (tf.reduce_sum(tf.cast(tf.logical_and(union, mask_bin), tf.float32)) + 0.00000001)
-				tf.summary.scalar("iou_class_0" + str(c), iou)
+				ious.append(iou)
+				# tf.summary.scalar("iou_class_0" + str(c), iou)
 
 	# Display prediction and groundtruth for object of class 1
 	with tf.variable_scope('soft_predictions'):
@@ -285,7 +293,7 @@ def u_net_loss(pred, label):
 				 			max_outputs=CONFIG.BATCH_SIZE)
 
 
-	return loss
+	return loss, ious
 
 
 
@@ -358,7 +366,7 @@ def train():
 
 		# Create Network and Loss operator
 		y    = u_net(points, neighbors, train_flag)
-		loss = u_net_loss(y, label)
+		loss, ious = u_net_loss(y, label)
 
 
 		# Creating optimizer
@@ -369,6 +377,13 @@ def train():
 			train_step = opt.minimize(loss)
 
 		# Merging summaries
+		iou_placeholders = []
+		iou_summaries = []
+		for c in range(1, CONFIG.N_CLASSES):
+			iou_placeholders.append(tf.placeholder(tf.float32))
+			iou_summaries.append(tf.summary.scalar("iou_class_0" + str(c), iou_placeholders[c-1]))
+		loss_placeholder = tf.placeholder(tf.float32)
+		loss_summary = tf.summary.scalar("loss", loss_placeholder)
 		summary_op = tf.summary.merge_all()
 
 		# Saver for checkpoints
@@ -415,24 +430,38 @@ def train():
 
 			# Training Network on the current batch
 			t = time.time()
-			_, loss_data, data = sess.run([train_step, loss, y], feed_dict={train_flag: True, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+			_, loss_data, ious_data, data = sess.run([train_step, loss, ious, y], feed_dict={train_flag: True, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
 
 			print('[Training] Iteration: {}, loss: {}, {} e/s '.format(int(i), loss_data, time_to_speed(time.time() - t, CONFIG.BATCH_SIZE)))
 
 			# If summary has to be saved
 			if i % 100 == 0:
-				summary_str = sess.run(summary_op, feed_dict={train_flag: True, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+				summary_dict = {train_flag: True, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch, loss_placeholder: loss_data}
+				for n in range(len(ious_data)):
+					summary_dict[iou_placeholders[n]] = ious_data[n]
+				summary_str = sess.run(summary_op, feed_dict= summary_dict)
 				train_summary_writer.add_summary(summary_str, i)
+
 			# If checkpoint has to be saved
 			if (i + 1) % CONFIG.SAVE_INTERVAL == 0:
 				saver.save(sess, CONFIG.OUTPUT_MODEL, global_step=i+1)
 			# If validation should be done
+
 			if i % CONFIG.VAL_INTERVAL == 0:
 				# Retrieving validation batch
-				points_batch, neighbors_batch, labels_batch = loader.read_batch(training = False)
-				#
+				val_loss = 0
+				val_iou = np.zeros(CONFIG.N_CLASSES-1)
+				for j in range(VALID_STEPS):
+					points_batch, neighbors_batch, labels_batch = loader.read_batch(training = False)
+					loss_data, ious_data, data = sess.run([loss, ious, y], feed_dict={train_flag: False, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+					val_loss += loss_data/VALID_STEPS
+					for k in range(len(ious_data)):
+						val_iou[k] += ious_data[k] / VALID_STEPS
 				# # Running summaries and saving
-				summary_str = sess.run(summary_op, feed_dict={train_flag: False, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch})
+				summary_dict = {train_flag: False, learning_rate: rate, points: points_batch, neighbors: neighbors_batch, label: labels_batch, loss_placeholder: val_loss}
+				for n in range(len(ious_data)):
+					summary_dict[iou_placeholders[n]] = val_iou[n]
+				summary_str = sess.run(summary_op, feed_dict= summary_dict)
 				val_summary_writer.add_summary(summary_str, i)
 
 				print("[Validation] Done on one batch")

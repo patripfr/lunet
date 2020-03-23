@@ -20,6 +20,8 @@ class Settings(object):
 	FOCAL_LOSS        = None
 	SAVE_INTERVAL     = None
 	VAL_INTERVAL      = None
+	LABEL_SMOOTHING   = None
+	ALPHA             = None
 
 	OUTPUT_PATH  = None
 	OUTPUT_MODEL = None
@@ -78,6 +80,7 @@ class Settings(object):
 			self.TFRECORD_TEST   = config["DATA"]["tfrecord_test"]
 			self.VALIDATION_RATIO = float(config["DATA"]["validation_ratio"])
 			self.AUGMENTATION   = eval(config["DATA"]["augmentation"])
+			self.RANDOM_FLIPPING   = eval(config["DATA"]["random_flipping"])
 			self.N_SIZE         = eval(config["DATA"]["n_size"])
 			self.N_LEN          = self.N_SIZE[0] * self.N_SIZE[1] - 1
 			self.CHANNELS       = config["DATA"]["channels"]
@@ -97,12 +100,14 @@ class Settings(object):
 			self.FOCAL_LOSS        = eval(config["TRAINING"]["focal_loss"])
 			self.SAVE_INTERVAL     = int(config["TRAINING_OUTPUT"]["save_interval"])
 			self.VAL_INTERVAL      = int(config["TRAINING"]["val_interval"])
+			self.LABEL_SMOOTHING   = eval(config["TRAINING"]["label_smoothing"])
+			self.ALPHA     		   = float(config["TRAINING"]["alpha"])
 
 			self.OUTPUT_PATH  = config["TRAINING_OUTPUT"]["path"]
 			self.OUTPUT_MODEL = self.OUTPUT_PATH + config["TRAINING_OUTPUT"]["model"]
 			self.OUTPUT_LOGS  = self.OUTPUT_PATH + config["TRAINING_OUTPUT"]["logs"]
 
-			self.TEST_OUTPUT_PATH    = config["TEST"]["output_path"]
+			self.TEST_OUTPUT_PATH    = self.OUTPUT_PATH + "test/"
 
 		if "checkpoint" in required_args and options.checkpoint:
 			self.TEST_CHECKPOINT = int(options.checkpoint)
@@ -115,3 +120,16 @@ class Settings(object):
 				checkpoints.append(int(checkpoint))
 
 			self.TEST_CHECKPOINT = max(checkpoints)
+
+		output_config_file_path = self.OUTPUT_PATH + "config.cfg"
+
+		if not os.path.exists(os.path.dirname(output_config_file_path)):
+			try:
+				os.makedirs(os.path.dirname(output_config_file_path))
+			except OSError as exc: # Guard against race condition
+				if exc.errno != errno.EEXIST:
+					raise
+					
+		output_config_file = open(output_config_file_path,'w')
+		config.write(output_config_file)
+		output_config_file.close()
